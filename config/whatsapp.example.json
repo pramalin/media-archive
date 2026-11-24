@@ -1,0 +1,4 @@
+{
+  "archive_root": "/mnt/d/Media-Archive",
+  "groups": [{"name": "Example Group", "directory": "Example-Group", "since": "2026-01-01"}]
+}

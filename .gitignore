@@ -24,3 +24,7 @@ output/
 # IDE
 .vscode/
 .idea/
+
+# WhatsApp private configuration and browser state
+config/*.local.json
+.browser-profile/
