@@ -25,4 +25,4 @@ Source code belongs in Git; private media, chat exports and catalogs belong on e
 
 ## Initial milestone
 
-Acquire WhatsApp media and preserve sender metadata where available. This bundle is the project scaffold; acquisition tooling is not yet implemented.
+Acquire WhatsApp media and preserve sender metadata where available. Recommended: import an Android "Export chat" ZIP — see `docs/whatsapp-import.md`. Photos from your own phone: `docs/phone-originals.md`; WhatsApp media saved on the phone: `docs/whatsapp-folder.md`. Then review and prune with readable copies — see `docs/review.md`. Browser-based tools (fallback): `docs/whatsapp-discovery.md`, `docs/whatsapp-acquisition.md`.

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- Minimal stand-in for the WhatsApp Web DOM used by the acquisition selectors. Synthetic data only. -->
+<html><head><meta charset="utf-8"><title>Mock WhatsApp</title></head>
+<body>
+<div id="pane-side"><div><span>Test Wedding Group</span></div></div>
+<div id="main">
+  <header><span title="Test Wedding Group">Test Wedding Group</span></header>
+  <div data-id="old-1"><div data-pre-plain-text="[9:15 AM, 10/01/2026] Shanthi: ">
+    <div aria-label="Open picture" data-file="old.jpg"><img alt=""></div></div></div>
+  <div data-id="msg-1"><div data-pre-plain-text="[5:49 PM, 11/12/2026] Shanthi: ">
+    <div aria-label="Open picture" data-file="IMG-20261112-WA0001.jpg" data-bytes="first"><img alt=""></div></div></div>
+  <div data-id="msg-2"><div data-pre-plain-text="[6:02 PM, 11/12/2026] Ravi: ">
+    <div aria-label="Open picture" data-file="IMG-20261112-WA0002.jpg" data-bytes="second"><img alt=""></div></div></div>
+  <div data-id="msg-3"><div data-pre-plain-text="[18:10, 11/12/2026] Shanthi: ">
+    <div aria-label="Open picture" data-file="IMG-20261112-WA0003.jpg" data-bytes="first"><img alt=""></div>
+    <div aria-label="Open picture" data-file="IMG-20261112-WA0004.jpg" data-bytes="third"><img alt=""></div></div></div>
+  <div data-id="msg-4"><div data-pre-plain-text="[6:20 PM, 11/12/2026] Shanthi: ">
+    <div aria-label="Quoted message"><div aria-label="Open picture" data-file="quoted.jpg"><img alt=""></div></div></div></div>
+  <div data-id="msg-5"><span>Shanthi</span>
+    <div aria-label="Open picture" data-file="nocaption.jpg" data-bytes="fifth"><img alt="" width="200" height="150"></div></div>
+</div>
+<div id="viewer" hidden><button aria-label="Download">Download</button></div>
+<script>
+  let current = null;
+  document.querySelectorAll('#main [aria-label="Open picture"]').forEach(el => el.addEventListener('click', () => {
+    current = el; document.getElementById('viewer').hidden = false;
+  }));
+  document.querySelector('#viewer button').addEventListener('click', () => {
+    const blob = new Blob(['photo bytes: ' + current.dataset.bytes], {type: 'image/jpeg'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = current.dataset.file;
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('viewer').hidden = true; });
+</script>
+</body></html>

@@ -6,6 +6,7 @@ import re
 import uuid
 from datetime import datetime, timezone, date
 from pathlib import Path
+from .browser import whatsapp_session
 from .whatsapp import parse_header
 
 PHOTO_SELECTOR = '[aria-label="Open picture"], [title="Open picture"]'
@@ -28,8 +29,37 @@ for (const e of document.querySelectorAll('#main [data-pre-plain-text]')) {
  header:e.getAttribute('data-pre-plain-text'), text:e.innerText});
 } return out; }"""
 
+TIME_FORMATS = ('%I:%M %p, %m/%d/%Y', '%H:%M, %m/%d/%Y')  # 12-hour (observed) and 24-hour clocks.
+
+# Structure of every rendered message (no message text), to adapt selectors to the live UI.
+DIAGNOSE = """() => [...document.querySelectorAll('#main [data-id]')].filter(r => !r.parentElement.closest('[data-id]')).map(r => {
+ const pre = r.querySelector('[data-pre-plain-text]');
+ const big = [...r.querySelectorAll('img')].filter(i => i.getBoundingClientRect().width >= 80);
+ const labels = new Set();
+ for (const e of r.querySelectorAll('[aria-label], [title], [role="button"]'))
+   labels.add(((e.getAttribute('role') === 'button' ? 'button:' : '') + (e.getAttribute('aria-label') || e.getAttribute('title') || '')).slice(0, 40));
+ return {id: (r.getAttribute('data-id') || '').slice(-8),
+         visible: (() => { const b = r.getBoundingClientRect(); return b.bottom > 0 && b.top < innerHeight; })(),
+         header: pre ? pre.getAttribute('data-pre-plain-text') : null,
+         large_images: big.length, videos: r.querySelectorAll('video').length,
+         labels: [...labels].filter(Boolean).slice(0, 15)};
+})"""
+
+def diagnose(page):
+    rows = page.evaluate(DIAGNOSE)
+    print(f'{len(rows)} rendered messages (oldest first). Text is not shown; labels may contain names.')
+    for r in rows:
+        print(f"[{'visible' if r['visible'] else 'offscreen'}] id=..{r['id']} header={r['header']!r} "
+              f"large_images={r['large_images']} videos={r['videos']} labels={r['labels']}")
+    return rows
+
 def parse_time(raw):
-    return datetime.strptime(raw, '%I:%M %p, %m/%d/%Y')
+    for fmt in TIME_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f'Unrecognized timestamp: {raw!r}')
 
 def eligible(rows, since, sender=None):
     result = []
@@ -86,11 +116,87 @@ def save_download(download, row, group, root, dest, manifest):
     finally:
         tmp.unlink(missing_ok=True)
 
+def open_photo(page, row):
+    escaped = json.dumps(row['message_id'], ensure_ascii=False)
+    controls = page.locator(f'#main [data-id={escaped}]').locator(", ".join(s+":visible" for s in PHOTO_SELECTOR.split(", ")))
+    # Ensure the locator matches the exact same filtered control set used in the scan.
+    handles = [h for h in controls.element_handles()
+               if h.evaluate('(x,s) => !x.closest(\'[aria-label="Quoted message"], [title="Quoted message"]\') && !x.parentElement.closest(s)', PHOTO_SELECTOR)]
+    handles[row['index']].click(timeout=5000)
+
+def download_from_viewer(page, row, group, root, dest, manifest):
+    # Only use a unique visible Download control outside the conversation.
+    buttons = page.locator('[aria-label="Download"]:visible, [title="Download"]:visible')
+    candidates = [b for b in buttons.element_handles() if b.evaluate('e => !e.closest("#main")')]
+    if len(candidates) == 1:
+        with page.expect_download(timeout=60000) as event:
+            candidates[0].click(timeout=5000)
+    else:
+        print('Click the Download icon in the opened viewer now (60 seconds).', flush=True)
+        with page.expect_download(timeout=60000) as event:
+            pass
+    return save_download(event.value, row, group, root, dest, manifest)
+
+def run(session, group, since, root, dest, manifest, sender=None, ask=input):
+    """Interactive acquisition loop. ``ask`` is injectable for tests."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+    done = existing(manifest, root)
+    name = group['name']
+    print(f"Open {name} and navigate to {since} or later.")
+    while True:
+        session.stage = 'waiting at the command prompt'
+        cmd = ask('Enter = scan visible photos, a = attempt group selection, d = diagnose, q = quit: ').strip().lower()
+        if cmd == 'q': return
+        page = session.page
+        if cmd == 'd':
+            session.stage = 'diagnosing the chat'
+            diagnose(page)
+            continue
+        if cmd == 'a':
+            session.stage = 'selecting the group'
+            matches = page.locator('#pane-side').get_by_text(name, exact=True)
+            if matches.count() == 1: matches.click(timeout=5000)
+            else: print('Select the group manually.')
+            continue
+        if cmd: continue
+        session.stage = 'scanning the chat'
+        if not page.evaluate(HEADER_CHECK, name):
+            print('Group not verified. No download.'); continue
+        rows = [r for r in eligible(page.evaluate(SCAN, PHOTO_SELECTOR), since, sender) if key(r) not in done]
+        print(f'{len(rows)} eligible visible photo controls not yet recorded.')
+        for i, row in enumerate(rows, 1): print(f"{i}: {row['sender']} | {row['timestamp_raw']} | photo {row['index']+1}")
+        if not rows: continue
+        session.stage = 'waiting for a photo choice'
+        choice = ask('Photo number to open (Enter = rescan): ').strip()
+        if not choice.isdigit() or not 1 <= int(choice) <= len(rows): continue
+        row = rows[int(choice)-1]
+        page = session.page
+        session.stage = 'opening the photo'
+        if not page.evaluate(HEADER_CHECK, name): continue
+        # Re-scan to avoid stale message or changed control ordering.
+        if row not in eligible(page.evaluate(SCAN, PHOTO_SELECTOR), since, sender):
+            print('Message changed; rescan.'); continue
+        try:
+            open_photo(page, row)
+        except (IndexError, PWTimeout):
+            print('Could not open photo; rescan.'); continue
+        print('Check the opened photo belongs to the selected message. Do not navigate to another photo.')
+        session.stage = 'waiting for photo confirmation'
+        if ask('Correct photo? [y/N]: ').strip().lower() != 'y':
+            print('Close the viewer manually before rescanning.'); continue
+        session.stage = 'downloading the photo'
+        try:
+            final = download_from_viewer(session.page, row, name, root, dest, manifest)
+            done.add(key(row)); print(f'Saved {final}\nManifest: {manifest}')
+        except (PWTimeout, ValueError, OSError) as exc:
+            print(f'Download not recorded: {exc}')
+        print('Close the media viewer manually before the next scan.')
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--config',default='config/whatsapp.local.json')
-    p.add_argument('--group',type=int,default=1)
-    p.add_argument('--sender',help='Optional exact sender filter')
+    p.add_argument('--config', default='config/whatsapp.local.json')
+    p.add_argument('--group', type=int, default=1)
+    p.add_argument('--sender', help='Optional exact sender filter')
     args = p.parse_args()
     cfg = json.loads(Path(args.config).read_text(encoding='utf-8'))
     if not 1 <= args.group <= len(cfg['groups']): p.error('Invalid group index')
@@ -98,66 +204,10 @@ def main():
     root = Path(cfg['archive_root']).expanduser()
     if not root.is_dir(): p.error(f'Archive root not found: {root}')
     since = date.fromisoformat(group['since'])
-    dest = root / 'WhatsApp' / group['directory']; dest.mkdir(parents=True,exist_ok=True)
+    dest = root / 'WhatsApp' / group['directory']; dest.mkdir(parents=True, exist_ok=True)
     manifest = root / 'Metadata' / 'whatsapp-acquisition' / (group['directory']+'.jsonl')
-    manifest.parent.mkdir(parents=True,exist_ok=True)
-    done = existing(manifest,root)
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    profile = Path.home()/'.local/share/media-archive/whatsapp-profile'
-    with sync_playwright() as pw:
-        context = pw.chromium.launch_persistent_context(str(profile),headless=False,accept_downloads=True)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.goto('https://web.whatsapp.com/',wait_until='domcontentloaded')
-            print(f"Open {group['name']} and navigate to {since} or later.")
-            while True:
-                cmd = input('Enter = scan visible photos, a = attempt group selection, q = quit: ').strip().lower()
-                if cmd == 'q': break
-                if cmd == 'a':
-                    matches = page.locator('#pane-side').get_by_text(group['name'],exact=True)
-                    if matches.count() == 1: matches.click(timeout=5000)
-                    else: print('Select the group manually.')
-                    continue
-                if cmd: continue
-                if not page.evaluate(HEADER_CHECK,group['name']):
-                    print('Group not verified. No download.'); continue
-                rows = [r for r in eligible(page.evaluate(SCAN,PHOTO_SELECTOR),since,args.sender) if key(r) not in done]
-                print(f'{len(rows)} eligible visible photo controls not yet recorded.')
-                for i,row in enumerate(rows,1): print(f"{i}: {row['sender']} | {row['timestamp_raw']} | photo {row['index']+1}")
-                if not rows: continue
-                choice = input('Photo number to open (Enter = rescan): ').strip()
-                if not choice.isdigit() or not 1 <= int(choice) <= len(rows): continue
-                row = rows[int(choice)-1]
-                if not page.evaluate(HEADER_CHECK,group['name']): continue
-                # Re-scan to avoid stale message or changed control ordering.
-                if row not in eligible(page.evaluate(SCAN,PHOTO_SELECTOR),since,args.sender):
-                    print('Message changed; rescan.'); continue
-                escaped = json.dumps(row['message_id'],ensure_ascii=False)
-                controls = page.locator(f'#main [data-id={escaped}]').locator(", ".join(s+":visible" for s in PHOTO_SELECTOR.split(", ")))
-                # Ensure locator matches the exact same filtered control set used in scan.
-                handles = controls.element_handles()
-                handles = [h for h in handles if h.evaluate('(x,s) => !x.closest(\'[aria-label="Quoted message"], [title="Quoted message"]\') && !x.parentElement.closest(s)',PHOTO_SELECTOR)]
-                try:
-                    handles[row['index']].click(timeout=5000)
-                except (IndexError,PWTimeout):
-                    print('Could not open photo; rescan.'); continue
-                print('Check the opened photo belongs to the selected message. Do not navigate to another photo.')
-                if input('Correct photo? [y/N]: ').strip().lower() != 'y':
-                    print('Close the viewer manually before rescanning.'); continue
-                try:
-                    # Only use a unique visible Download control outside the conversation.
-                    buttons = page.locator('[aria-label="Download"]:visible, [title="Download"]:visible')
-                    candidates = [b for b in buttons.element_handles() if b.evaluate('e => !e.closest("#main")')]
-                    if len(candidates)==1:
-                        with page.expect_download(timeout=60000) as event: candidates[0].click(timeout=5000)
-                    else:
-                        print('Click the Download icon in the opened viewer now (60 seconds).',flush=True)
-                        with page.expect_download(timeout=60000) as event: pass
-                    final = save_download(event.value,row,group['name'],root,dest,manifest)
-                    done.add(key(row)); print(f'Saved {final}\nManifest: {manifest}')
-                except (PWTimeout,ValueError,OSError) as exc:
-                    print(f'Download not recorded: {exc}')
-                print('Close the media viewer manually before the next scan.')
-        finally: context.close()
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    with whatsapp_session(accept_downloads=True) as session:
+        run(session, group, since, root, dest, manifest, args.sender)
 
-if __name__=='__main__': main()
+if __name__ == '__main__': main()

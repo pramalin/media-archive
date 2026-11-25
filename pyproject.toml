@@ -14,3 +14,4 @@ where = ["src"]
 
 [project.optional-dependencies]
 whatsapp = ["playwright>=1.48,<2"]
+photos = ["pillow>=10"]
